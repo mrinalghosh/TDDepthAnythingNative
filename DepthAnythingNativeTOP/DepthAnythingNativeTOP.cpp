@@ -110,9 +110,15 @@ void DepthAnythingNativeTOP::getGeneralInfo(TOP_GeneralInfo* ginfo, const OP_Inp
 
 void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved1) {
     // TIP E1: Get the input: const OP_TOPInput* top = inputs->getInputTOP(0); return early if it's nullptr.
-    //
+    const OP_TOPInput* top = inputs->getInputTOP(0);
+    if (!top) {
+        return;
+    }
+
     // TIP E2: Make sure the model is loaded (synchronous version; the worker does this in the threaded one).
     //         Only try once: set myLoadTried = true first, so a failing load isn't repeated every cook.
+    bool myLoadTried = true;  // do I declare this here or globally?
+
     //         Pick the path: the Model parameter if it's set (P1), otherwise the bundled model:
     //             char path[1024];
     //             if (depth_bundled_model_path(path, sizeof path) != 0) { myError = "No bundled model"; return; }
@@ -230,11 +236,30 @@ void DepthAnythingNativeTOP::setupParameters(OP_ParameterManager* manager, void*
     //             OP_ParAppendResult res = manager->appendFolder(sp);   // .mlmodelc is a folder, not a file
     //             assert(res == OP_ParAppendResult::Success);
     //         Read it with inputs->getParFilePath("Model"): an absolute path when it exists. Empty = bundled model.
+    OP_StringParameter sp;
+    sp.name = "Model";
+    sp.label = "Model (.mlmodelc)";
+    sp.defaultValue = "";
+    OP_ParAppendResult res = manager->appendFolder(sp);
+    assert(res == OP_ParAppendResult::Success);
+
     // TIP P2: A raw/normalized switch for E5:
     //             OP_NumericParameter np;  np.name = "Normalize";  np.label = "Normalize";  np.defaultValues[0] = 1;
     //             manager->appendToggle(np);          // read with inputs->getParInt("Normalize")
+    OP_NumericParameter np;
+    np.name = "Normalize";
+    np.label = "Normalize";
+    np.defaultValues[0] = 1;
+    res = manager->appendToggle(np);
+    assert(res == OP_ParAppendResult::Success);
+
     // TIP P3: A "Reload" pulse (manager->appendPulse(np)), handled in pulsePressed(): destroy the model and clear
     //         myError so the next cook loads it again, e.g. after changing Model.
+    OP_NumericParameter reload;
+    reload.name = "Reload";
+    reload.label = "Reload";
+    res = manager->appendPulse(reload);
+    assert(res == OP_ParAppendResult::Success);
 }
 
 void DepthAnythingNativeTOP::pulsePressed(const char* name, void* reserved1) {
