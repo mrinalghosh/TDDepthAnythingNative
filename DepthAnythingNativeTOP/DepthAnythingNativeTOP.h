@@ -62,7 +62,9 @@ class DepthAnythingNativeTOP : public TOP_CPlusPlusBase {
 
     // TIP M1: Members you'll likely add as you go (none are needed to compile):
     //   DepthModel*                        myModel = nullptr;  owned; depth_destroy it in the destructor
-    //   std::vector<float>                 myDepth;            outW * outH, filled by depth_run
+    //   bool                               myLoadTried = false; so a failed load isn't retried every cook
+    //   int                                myOutW = 0, myOutH = 0;  from depth_output_size (518x392)
+    //   std::vector<float>                 myDepth;            myOutW * myOutH, filled by depth_run
     //   std::string                        myError;            returned by getErrorString(); empty = no error
     //   OP_SmartRef<OP_TOPDownloadResult>  myPrevDownload;     last frame's download (E3's no-stall option)
     //   double                             myRunMs = 0;        last depth_run time, for the Info CHOP
@@ -71,6 +73,7 @@ class DepthAnythingNativeTOP : public TOP_CPlusPlusBase {
     //   std::mutex                         myLock;             guards everything shared with the worker
     //   std::condition_variable            myWake;             execute() -> worker: "new frame" or "exit"
     //   OP_SmartRef<OP_TOPDownloadResult>  myPending;          newest input frame waiting for the worker
+    //   std::string                        myModelPath;        resolved in execute(), loaded by the worker
     //   bool                               myExit = false;
     //   void                               workerLoop();
 };

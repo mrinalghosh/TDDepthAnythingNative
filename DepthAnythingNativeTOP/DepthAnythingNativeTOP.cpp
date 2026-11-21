@@ -89,13 +89,15 @@ DepthAnythingNativeTOP::DepthAnythingNativeTOP(const OP_NodeInfo* info, TOP_Cont
     : myNodeInfo(info), myContext(context), myFrameQueue(context) {
     // TIP C1: Don't load the model here. depth_create takes ~10 s every time TD starts (Core ML prepares the model
     //         for the Neural Engine on each new process), and TD's UI is frozen for as long as the constructor runs.
-    //         Synchronous version: load lazily on the first cook (E2). Threaded version: start the worker here (W1)
-    //         and load it at the top of the worker.
+    //         Synchronous version: load lazily on the first cook (E2). Threaded version: start the worker on the
+    //         first cook too (W1), since only execute() can read the Model parameter, and load it in the worker.
 }
 
 DepthAnythingNativeTOP::~DepthAnythingNativeTOP() {
     // TIP D1: Threaded version: stop the worker first. Set myExit = true while holding myLock, myWake.notify_one(),
-    //         then myWorker.join(). It may be in the middle of depth_run, so the model must outlive it.
+    //         then join it, but only if (myWorker.joinable()): the worker starts on the first cook, so a TOP that
+    //         never cooked has none, and join() on an empty std::thread throws (= TD crashes).
+    //         It may be in the middle of depth_run, so the model must outlive it.
     // TIP D2: Then depth_destroy(myModel); it's fine to call with nullptr.
     // TIP D3: OP_SmartRef members (download results, buffers) release themselves; nothing to do for those.
 }
@@ -110,18 +112,25 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
     // TIP E1: Get the input: const OP_TOPInput* top = inputs->getInputTOP(0); return early if it's nullptr.
     //
     // TIP E2: Make sure the model is loaded (synchronous version; the worker does this in the threaded one).
-    //         On the first cook, pick the path: the Model parameter if it's set (P1), otherwise the bundled model:
+    //         Only try once: set myLoadTried = true first, so a failing load isn't repeated every cook.
+    //         Pick the path: the Model parameter if it's set (P1), otherwise the bundled model:
     //             char path[1024];
-    //             depth_bundled_model_path(path, sizeof path);   // nonzero = not found
-    //         then myModel = depth_create(path, err, sizeof err). On nullptr, copy err into myError and return; the
-    //         node shows it via getErrorString() (R1). Don't retry every cook: a failing load still costs time.
-    //         After loading: depth_output_size(myModel, &outW, &outH) and myDepth.resize(outW * outH).
+    //             if (depth_bundled_model_path(path, sizeof path) != 0) { myError = "No bundled model"; return; }
+    //         then load it:
+    //             char err[512];
+    //             myModel = depth_create(path, err, sizeof err);
+    //         On nullptr, myError = err and return; the node shows it via getErrorString() (R1).
+    //         After loading: depth_output_size(myModel, &myOutW, &myOutH) and myDepth.resize(myOutW * myOutH).
+    //         (E4-E6 below write outW/outH for short; they mean myOutW/myOutH.)
     //
     // TIP E3: Download the input as top-down BGRA, exactly what depth_run expects:
     //             OP_TOPInputDownloadOptions opts;
     //             opts.pixelFormat  = OP_PixelFormat::BGRA8Fixed;
     //             opts.verticalFlip = true;   // TD's textures are bottom-up; the model wants row 0 = top
+    //             opts.colorSpace   = OP_ColorSpace::SRGB;   // the model was trained on ordinary sRGB photos
     //             OP_SmartRef<OP_TOPDownloadResult> res = top->downloadTexture(opts, nullptr);
+    //         (Without colorSpace, the pixels follow the project's Working Color Space; in ACEScg, say, the model
+    //         would get linear values and the depth gets subtly worse.)
     //         res->getData() blocks until the GPU->CPU copy lands. Either accept that stall for a first version, or do
     //         what the CPUMemoryTOP sample does: keep this frame's result in myPrevDownload and process last frame's
     //         instead (one frame of latency, no stall). Watch for an empty myPrevDownload on the first cook.
@@ -149,6 +158,7 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
     //             info.textureDesc.texDim      = OP_TexDim::e2D;
     //             info.textureDesc.pixelFormat = OP_PixelFormat::Mono32Float;
     //             info.firstPixel = TOP_FirstPixel::TopLeft;   // our rows are top-down (E3); TD flips them back
+    //             info.colorSpace = OP_ColorSpace::Passthrough; // depth is data, not color: never convert it
     //             output->uploadBuffer(&buf, info, nullptr);   // takes ownership: buf is empty afterwards
     //         Output is 518x392 whatever the input size; resample it downstream (Fit or Resolution TOP) to match.
     //         Mono32Float keeps full precision for displacement; Mono16Float halves the upload if that's enough.
@@ -161,10 +171,12 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
 }
 
 // ---- Worker thread (threaded version) ----
-// TIP W1: Add `void workerLoop();` to the class and start it once, in the constructor or on the first cook:
-//             myWorker = std::thread([this] { workerLoop(); });
-//         Load the model at the top of workerLoop (E2's code moves here), so the ~10 s load never blocks TD. Store
-//         load errors in myError (under myLock), and use getWarningString to show "Loading model..." meanwhile (R2).
+// TIP W1: Add `void workerLoop();` to the class and start it once, on the first cook:
+//             if (!myWorker.joinable()) { myModelPath = path; myWorker = std::thread([this] { workerLoop(); }); }
+//         Resolve `path` in execute() first (E2's path logic): the worker can't read parameters, since `inputs` only
+//         exists during execute(). Load the model at the top of workerLoop (the rest of E2 moves here), so the
+//         ~10 s load never blocks TD. Store load errors in myError (under myLock), and use getWarningString to show
+//         "Loading model..." meanwhile (R2).
 // TIP W2: execute() hands frames over: lock myLock, myPending = std::move(res), unlock, myWake.notify_one().
 //         Overwriting a frame the worker hasn't started yet is intended: it should always take the newest frame.
 // TIP W3: workerLoop: wait on myWake until myPending or myExit is set; on myExit, return. Move myPending into a local
