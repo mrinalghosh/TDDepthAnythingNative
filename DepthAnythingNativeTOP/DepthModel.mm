@@ -7,6 +7,7 @@
 #import <CoreML/CoreML.h>           // MLModel, MLModelConfiguration, MLDictionaryFeatureProvider, MLFeatureValue
 #import <CoreVideo/CoreVideo.h>     // CVPixelBuffer: the model's "image" input and "depth" output are both pixel buffers
 #import <Accelerate/Accelerate.h>   // vImage: scaling + half->float (build.sh links -framework Accelerate)
+#include <dlfcn.h>                  // dladdr: which binary (the plugin) this code was loaded from
 
 // ---- 1. struct DepthModel ----
 // 1a. Holds: MLModel *model (ARC releases it on delete, even inside a C++ struct in a .mm file).
@@ -235,5 +236,38 @@ void depth_destroy(DepthModel *model)
         CVPixelBufferRelease(model->input);  // CF object: ARC doesn't manage it
         model->input = NULL;
         delete model;                        // ARC releases the strong MLModel field here
+    }
+}
+
+// ---- 6. depth_bundled_model_path ----
+// 6a. dladdr on one of our own functions gives the path of the binary that contains it. Inside the plugin that's
+//     .../DepthAnythingNativeTOP.plugin/Contents/MacOS/DepthAnythingNativeTOP, so two levels up is Contents/.
+// 6b. build.sh copies the compiled model into Contents/Resources/; take the first *.mlmodelc found there.
+
+int depth_bundled_model_path(char *buf, size_t len)
+{
+    if (!buf || len == 0)
+        return 1;
+    buf[0] = '\0';
+
+    @autoreleasepool {
+        Dl_info info;
+        if (!dladdr((const void *)&depth_bundled_model_path, &info) || !info.dli_fname)
+            return 2;
+
+        NSString *binary = [NSString stringWithUTF8String:info.dli_fname];
+        NSString *resources = [[[binary stringByDeletingLastPathComponent] stringByDeletingLastPathComponent]
+                               stringByAppendingPathComponent:@"Resources"];
+
+        NSArray<NSString *> *names =
+            [[[NSFileManager defaultManager] contentsOfDirectoryAtPath:resources error:nil]
+                sortedArrayUsingSelector:@selector(compare:)];
+        for (NSString *name in names) {
+            if ([name.pathExtension isEqualToString:@"mlmodelc"]) {
+                NSString *path = [resources stringByAppendingPathComponent:name];
+                return strlcpy(buf, path.fileSystemRepresentation, len) < len ? 0 : 3;  // 3 = buf too small
+            }
+        }
+        return 4;  // no bundled model (not running from the plugin, or build.sh didn't copy one)
     }
 }

@@ -38,6 +38,11 @@ int depth_run(DepthModel *model, const uint8_t *bgra, int width, int height, siz
 // Frees everything; safe to call with NULL.
 void depth_destroy(DepthModel *model);
 
+// Finds the model build.sh bundles into the plugin (DepthAnythingNativeTOP.plugin/Contents/Resources/*.mlmodelc) and
+// copies its absolute path into buf. Returns 0 on success, nonzero if there is none, e.g. when called from a program
+// that isn't the plugin (like test_main), or if buf is too small (1024 bytes is plenty).
+int depth_bundled_model_path(char *buf, size_t len);
+
 #ifdef __cplusplus
 }
 #endif
