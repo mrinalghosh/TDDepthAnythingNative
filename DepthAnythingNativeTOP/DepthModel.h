@@ -30,7 +30,7 @@ void depth_output_size(const DepthModel *model, int *outW, int *outH);
 //    scaled to the model's input size internally.
 //  - stride: bytes per row of bgra. Pass it explicitly; don't assume width * 4.
 //  - depthOut: caller-owned float buffer of outW * outH, filled with relative inverse depth (bigger = closer).
-//    The model scales its output so the nearest point is 1.0.
+//    The model scales its output so the nearest point is about 1.0 (0.9995-1.0 in tests); the far end varies.
 //  - Returns 0 on success, nonzero on failure (codes are listed above depth_run in DepthModel.mm).
 //  - Not thread-safe per model (the input buffer is reused): call it from one thread at a time.
 int depth_run(DepthModel *model, const uint8_t *bgra, int width, int height, size_t stride, float *depthOut);
