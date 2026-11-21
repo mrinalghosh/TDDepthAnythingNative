@@ -12,37 +12,38 @@
  * prior written permission from Derivative.
  */
 
+#include "DepthAnythingNativeTOP.h"
+
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
 #include <chrono>
-#include <cmath>
-#include <random>
 
-#include "DepthAnythingNativeTOP.h"
+// =====================================================================================================================
+// How the pieces fit together
+//
+//   execute()  [TD main thread, once per cook]          worker thread  [threaded version only]
+//   ------------------------------------------          --------------------------------------
+//   E1 get input TOP
+//   E3 start GPU->CPU download  -- OP_TOPDownloadResult -->  getData()  (waits for the download)
+//                                                            E4 depth_run   (~25 ms on an M-series Mac)
+//                                                            E5 normalize into a TOP_Buffer
+//   E6 upload newest finished buffer  <-- FrameQueue -----  updateComplete()
+//
+// Plan of attack:
+//   1. Synchronous first: do E1-E6 all inside execute(). Simple to debug, but TD's frame waits on the model, so
+//      expect roughly 30-40 fps at best.
+//   2. Then threaded: keep E1/E3/E6 in execute() and move E4/E5 to a worker (TIP W1-W5). TD runs at full rate and
+//      the depth map updates as fast as the model can go. ../CPUMemoryTOP/CPUMemoryTOP.cpp (THREADING_EXAMPLE) does
+//      the same FrameQueue hand-off with a test pattern; it's worth reading first.
+//
+// Iterating: ./build.sh && ./install.sh, then restart TouchDesigner (it only loads plugins at startup).
+// Check DepthModel on its own with ./test.sh photo.jpg out.png; no TD restart needed.
+// =====================================================================================================================
 
-// Uncomment this if you want to run an example that fills the data using threading
-// #define THREADING_EXAMPLE
-
-// The threading example can run in two modes. One where the producer is continually
-// producing new frames that the consumer (main thread) picks up when able.
-// This more is useful for things such as external device input. This is the default
-// mode.
-
-// The second mode can be instead used by also defining THREADING_SIGNALED_PRODUCER.
-// (I.e Uncommenting the below line)
-// In this mode the main thread will signal to the producer thread to generate a new
-// frame each time it consumes a frame.
-// Assuming the producer will generate a new frame in time before execute() gets called
-// again this gives a better 1:1 sync between producing and consuming frames.
-
-// #define THREADING_SIGNALED_PRODUCER
-
-// These functions are basic C function, which the DLL loader can find
-// much easier than finding a C++ Class.
-// The DLLEXPORT prefix is needed so the compile exports these functions from the .dll
-// you are creating
+// Plugin entry points. TD finds these plain C functions by name when it loads the .plugin.
 extern "C" {
 
 DLLEXPORT
@@ -51,406 +52,180 @@ void FillTOPPluginInfo(TOP_PluginInfo* info) {
     if (!info->setAPIVersion(TOPCPlusPlusAPIVersion))
         return;
 
-    // Change this to change the executeMode behavior of this plugin.
+    // CPU memory mode: we fill CPU buffers and TD uploads them to textures for us.
     info->executeMode = TOP_ExecuteMode::CPUMem;
 
-    // The opType is the unique name for this TOP. It must start with a
-    // capital A-Z character, and all the following characters must lower case
-    // or numbers (a-z, 0-9)
-    info->customOPInfo.opType->setString("Cpumemsample");
+    // Unique name for this TOP: a capital A-Z first, then only lower case a-z or 0-9.
+    info->customOPInfo.opType->setString("Depthanything");
 
-    // The opLabel is the text that will show up in the OP Create Dialog
-    info->customOPInfo.opLabel->setString("CPU Mem Sample");
+    // The text that shows up in the OP Create Dialog, and the 3 letter icon on the node.
+    info->customOPInfo.opLabel->setString("Depth Anything");
+    info->customOPInfo.opIcon->setString("DEP");
 
-    // Will be turned into a 3 letter icon on the nodes
-    info->customOPInfo.opIcon->setString("CPM");
+    info->customOPInfo.authorName->setString("Mrinal Ghosh");
+    info->customOPInfo.authorEmail->setString("");
 
-    // Information about the author of this OP
-    info->customOPInfo.authorName->setString("Author Name");
-    info->customOPInfo.authorEmail->setString("email@email.com");
-
-    // This TOP works with 0 or 1 inputs connected
-    info->customOPInfo.minInputs = 0;
+    // Needs exactly one image to estimate depth from; TD flags the node if it's missing.
+    info->customOPInfo.minInputs = 1;
     info->customOPInfo.maxInputs = 1;
 
-    // Custom website URL that the Operator Help can point to
-    info->customOPInfo.opHelpURL->setString("yourwebsiteurl.com");
+    info->customOPInfo.opHelpURL->setString("https://github.com/mrinalghosh/TDDepthAnythingNative");
 }
 
 DLLEXPORT
-TOP_CPlusPlusBase*
-CreateTOPInstance(const OP_NodeInfo* info, TOP_Context* context) {
-    // Return a new instance of your class every time this is called.
-    // It will be called once per TOP that is using the .dll
+TOP_CPlusPlusBase* CreateTOPInstance(const OP_NodeInfo* info, TOP_Context* context) {
+    // Called once per Depth Anything TOP in the project.
     return new DepthAnythingNativeTOP(info, context);
 }
 
 DLLEXPORT
 void DestroyTOPInstance(TOP_CPlusPlusBase* instance, TOP_Context* context) {
-    // Delete the instance here, this will be called when
-    // Touch is shutting down, when the TOP using that instance is deleted, or
-    // if the TOP loads a different DLL
+    // Called when the TOP is deleted, TD shuts down, or the TOP loads a different plugin.
     delete (DepthAnythingNativeTOP*)instance;
 }
 };
 
-DepthAnythingNativeTOP::DepthAnythingNativeTOP(const OP_NodeInfo* info, TOP_Context* context) : myNodeInfo(info),
-                                                                                                myThread(nullptr),
-                                                                                                myThreadShouldExit(false),
-                                                                                                myStartWork(false),
-                                                                                                myContext(context),
-                                                                                                myFrameQueue(context) {
-    myExecuteCount = 0;
-    myStep = 0.0;
-    myBrightness = 1.0;
+DepthAnythingNativeTOP::DepthAnythingNativeTOP(const OP_NodeInfo* info, TOP_Context* context)
+    : myNodeInfo(info), myContext(context), myFrameQueue(context) {
+    // TIP C1: Don't load the model here. depth_create takes ~10 s every time TD starts (Core ML prepares the model
+    //         for the Neural Engine on each new process), and TD's UI is frozen for as long as the constructor runs.
+    //         Synchronous version: load lazily on the first cook (E2). Threaded version: start the worker here (W1)
+    //         and load it at the top of the worker.
 }
 
 DepthAnythingNativeTOP::~DepthAnythingNativeTOP() {
-#ifdef THREADING_EXAMPLE
-    if (myThread) {
-        myThreadShouldExit.store(true);
-        // Incase the thread is sleeping waiting for a signal
-        // to create more work, wake it up
-        startMoreWork();
-        if (myThread->joinable()) {
-            myThread->join();
-        }
-        delete myThread;
-    }
-#endif
+    // TIP D1: Threaded version: stop the worker first. Set myExit = true while holding myLock, myWake.notify_one(),
+    //         then myWorker.join(). It may be in the middle of depth_run, so the model must outlive it.
+    // TIP D2: Then depth_destroy(myModel); it's fine to call with nullptr.
+    // TIP D3: OP_SmartRef members (download results, buffers) release themselves; nothing to do for those.
 }
 
 void DepthAnythingNativeTOP::getGeneralInfo(TOP_GeneralInfo* ginfo, const OP_Inputs* inputs, void* reserved1) {
+    // Cook every frame while something downstream is looking at this TOP, so new depth frames show up even if the
+    // input itself didn't change (the threaded version finishes frames asynchronously).
     ginfo->cookEveryFrameIfAsked = true;
 }
 
 void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs, void* reserved1) {
-    myExecuteCount++;
-
-#ifdef THREADING_EXAMPLE
-    mySettingsLock.lock();
-#endif
-
-    double speed = inputs->getParDouble("Speed");
-    mySpeed = speed;
-
-    myBrightness = inputs->getParDouble("Brightness");
-
-    // See comments at the top of this file to information about the threading
-    // example mode for this project.
-#ifdef THREADING_EXAMPLE
-    mySettingsLock.unlock();
-
-    if (!myThread) {
-        myThread = new std::thread(
-            [this]() {
-                std::random_device rd;
-                std::mt19937 mt(rd());
-
-                // We are going to generate new frame data at irregular interval
-                std::uniform_real_distribution<double> dist(10.0, 40.0);
-
-                // Exit when our owner tells us to
-                while (!this->myThreadShouldExit) {
-#ifdef THREADING_SIGNALED_PRODUCER
-                    this->waitForMoreWork();
-                    // We may be waking up because the owner is trying to shut down
-                    if (myThreadShouldExit) {
-                        break;
-                    }
-#else
-                    auto begin = std::chrono::steady_clock::now();
-#endif
-
-                    TOP_UploadInfo info;
-                    info.textureDesc.width = 256;
-                    info.textureDesc.height = 256;
-                    info.textureDesc.texDim = OP_TexDim::e2D;
-                    info.textureDesc.pixelFormat = OP_PixelFormat::RGBA32Float;
-                    uint64_t size = uint64_t(info.textureDesc.width) * info.textureDesc.height * sizeof(float) * 4;
-                    OP_SmartRef<TOP_Buffer> buf = this->myFrameQueue.getBufferToUpdate(size, TOP_BufferFlags::None);
-
-                    // If there is a buffer to update
-                    if (buf) {
-                        this->mySettingsLock.lock();
-                        myStep += mySpeed;
-                        double brightness = myBrightness;
-                        this->mySettingsLock.unlock();
-
-                        DepthAnythingNativeTOP::fillBuffer(buf, 0, info.textureDesc.width, info.textureDesc.height, myStep, brightness);
-
-                        BufferInfo bufInfo;
-                        bufInfo.buf = buf;
-                        bufInfo.uploadInfo = info;
-                        this->myFrameQueue.updateComplete(bufInfo);
-                    }
-
-#ifndef THREADING_SIGNALED_PRODUCER
-                    auto end = std::chrono::steady_clock::now();
-                    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count();
-
-                    // Sleep for a 15.5ms. We want our loops to be 16.666ms, so this give some wiggle wrong.
-                    // In almost all cases we wouldn't be manually sleeping, but instead sleeping
-                    // using a function from the SDK of the device that we are reading.
-                    std::this_thread::sleep_for(std::chrono::microseconds(15500 - duration));
-#endif
-                }
-            });
-    }
-
-    // Tries to assign a buffer to be uploaded to the TOP
-    BufferInfo bufInfo = myFrameQueue.getBufferToUpload();
-
-    if (bufInfo.buf)
-        output->uploadBuffer(&bufInfo.buf, bufInfo.uploadInfo, nullptr);
-
-#ifdef THREADING_SIGNALED_PRODUCER
-    // Tell the thread to make another frame
-    startMoreWork();
-#endif
-
-#else
-
-    fillAndUpload(output, speed, 256, 256, OP_TexDim::e2D, 1, 0);
-    // You can uncomment these to upload other texture dimension types, to other color buffer indices.
-    // Use a Render Select TOP to view the other textures
-    // fillAndUpload(output, speed, 256, 256, OP_TexDim::eCube, 1, 1);
-    // fillAndUpload(output, speed, 64, 64, OP_TexDim::e3D, 32, 2);
-
-    if (inputs->getNumInputs() > 0) {
-        // Although you'd generally never want to download a texture only to re-upload it.
-        // This is here to show how to read from a TOP input into CPU memory.
-        // More typically would be used to output the image data to another output device/file.
-        const OP_TOPInput* top = inputs->getInputTOP(0);
-        if (top) {
-            OP_TOPInputDownloadOptions opts;
-            // If you want to download the texture as a particular format, regardless of what it is
-            // on the GPU, you can force it here.
-            // opts.pixelFormat = OP_PixelFormat::RGBA32Float;
-            OP_SmartRef<OP_TOPDownloadResult> downRes = top->downloadTexture(opts, nullptr);
-
-            // the getData() call on OP_TOPDownloadResult will stall until the download is finished.
-            // This is usually a while, but less than a full frame, so instead of stalling on it
-            // we keep track of the previous download result, and use that to output.
-            // This avoids a stall, but results in the uploaded image being 1 frame behind in this
-            // example.
-            // More typical situations involve outputing to a device/file later on, possibly
-            // passing the OP_SmartRef<OP_TOPDownloadResult> to another thread so it can stall
-            // and process the data as soon as it's ready.
-            if (myPrevDownRes) {
-                TOP_UploadInfo info;
-                info.textureDesc = myPrevDownRes->textureDesc;
-
-                // Notice this is setting the 3rd buffer. A Render Select TOP requesting buffer index 3 is used
-                // to view this result.
-                info.colorBufferIndex = 3;
-                OP_SmartRef<TOP_Buffer> buf = myContext->createOutputBuffer(myPrevDownRes->size, TOP_BufferFlags::None, nullptr);
-
-                memcpy(buf->data, myPrevDownRes->getData(), myPrevDownRes->size);
-
-                output->uploadBuffer(&buf, info, nullptr);
-            }
-            myPrevDownRes = std::move(downRes);
-        }
-    }
-#endif
+    // TIP E1: Get the input: const OP_TOPInput* top = inputs->getInputTOP(0); return early if it's nullptr.
+    //
+    // TIP E2: Make sure the model is loaded (synchronous version; the worker does this in the threaded one).
+    //         On the first cook, pick the path: the Model parameter if it's set (P1), otherwise the bundled model:
+    //             char path[1024];
+    //             depth_bundled_model_path(path, sizeof path);   // nonzero = not found
+    //         then myModel = depth_create(path, err, sizeof err). On nullptr, copy err into myError and return; the
+    //         node shows it via getErrorString() (R1). Don't retry every cook: a failing load still costs time.
+    //         After loading: depth_output_size(myModel, &outW, &outH) and myDepth.resize(outW * outH).
+    //
+    // TIP E3: Download the input as top-down BGRA, exactly what depth_run expects:
+    //             OP_TOPInputDownloadOptions opts;
+    //             opts.pixelFormat  = OP_PixelFormat::BGRA8Fixed;
+    //             opts.verticalFlip = true;   // TD's textures are bottom-up; the model wants row 0 = top
+    //             OP_SmartRef<OP_TOPDownloadResult> res = top->downloadTexture(opts, nullptr);
+    //         res->getData() blocks until the GPU->CPU copy lands. Either accept that stall for a first version, or do
+    //         what the CPUMemoryTOP sample does: keep this frame's result in myPrevDownload and process last frame's
+    //         instead (one frame of latency, no stall). Watch for an empty myPrevDownload on the first cook.
+    //
+    // TIP E4: Run the model:
+    //             int w = res->textureDesc.width, h = res->textureDesc.height;
+    //             size_t stride = res->size / h;          // bytes per row; don't assume w * 4
+    //             int rc = depth_run(myModel, (const uint8_t*)res->getData(), w, h, stride, myDepth.data());
+    //         Nonzero rc = failure (codes are listed above depth_run in DepthModel.mm). Time it with
+    //         std::chrono::steady_clock into myRunMs for the Info CHOP (I1).
+    //
+    // TIP E5: Normalize into an output buffer:
+    //             OP_SmartRef<TOP_Buffer> buf =
+    //                 myContext->createOutputBuffer(outW * outH * sizeof(float), TOP_BufferFlags::None, nullptr);
+    //             float* px = (float*)buf->data;
+    //         The model already outputs ~0..1 with 1 = nearest point, but the far end rarely reaches 0, so a min/max
+    //         stretch (std::minmax_element; guard max == min) gives a fuller range. Per-frame min/max makes the
+    //         image "breathe" when objects enter or leave; smoothing min and max over time (e.g.
+    //         m = m * 0.9 + frameMin * 0.1) calms it down. A toggle for raw output (P2) is handy for comparing.
+    //
+    // TIP E6: Upload:
+    //             TOP_UploadInfo info;
+    //             info.textureDesc.width       = outW;
+    //             info.textureDesc.height      = outH;
+    //             info.textureDesc.texDim      = OP_TexDim::e2D;
+    //             info.textureDesc.pixelFormat = OP_PixelFormat::Mono32Float;
+    //             info.firstPixel = TOP_FirstPixel::TopLeft;   // our rows are top-down (E3); TD flips them back
+    //             output->uploadBuffer(&buf, info, nullptr);   // takes ownership: buf is empty afterwards
+    //         Output is 518x392 whatever the input size; resample it downstream (Fit or Resolution TOP) to match.
+    //         Mono32Float keeps full precision for displacement; Mono16Float halves the upload if that's enough.
+    //
+    // Threaded version (TIP W1-W5 below): keep E1 and E3 here, but hand `res` to the worker instead of calling
+    // getData(), and upload whatever the worker finished last:
+    //             BufferInfo done = myFrameQueue.getBufferToUpload();
+    //             if (done.buf) output->uploadBuffer(&done.buf, done.uploadInfo, nullptr);
+    //         When nothing new is ready, skip the upload, as the sample's threading example does.
 }
 
-void DepthAnythingNativeTOP::fillAndUpload(TOP_Output* output, double speed, int width, int height, OP_TexDim texDim, int numLayers, int colorBufferIndex) {
-    TOP_UploadInfo info;
-    info.textureDesc.texDim = texDim;
-    info.textureDesc.width = width;
-    info.textureDesc.height = height;
-    info.textureDesc.pixelFormat = OP_PixelFormat::RGBA32Float;
-    if (texDim == OP_TexDim::e2DArray || texDim == OP_TexDim::e3D)
-        info.textureDesc.depth = numLayers;
-    else if (texDim == OP_TexDim::eCube) {
-        // It's only 1 layer for the actual texture, but we want to fill 6 sides for the cube work of data
-        numLayers = 6;
-    }
+// ---- Worker thread (threaded version) ----
+// TIP W1: Add `void workerLoop();` to the class and start it once, in the constructor or on the first cook:
+//             myWorker = std::thread([this] { workerLoop(); });
+//         Load the model at the top of workerLoop (E2's code moves here), so the ~10 s load never blocks TD. Store
+//         load errors in myError (under myLock), and use getWarningString to show "Loading model..." meanwhile (R2).
+// TIP W2: execute() hands frames over: lock myLock, myPending = std::move(res), unlock, myWake.notify_one().
+//         Overwriting a frame the worker hasn't started yet is intended: it should always take the newest frame.
+// TIP W3: workerLoop: wait on myWake until myPending or myExit is set; on myExit, return. Move myPending into a local
+//         while holding the lock, then unlock before the slow part: getData() (thread-safe; may wait for the GPU),
+//         depth_run (E4), normalize (E5).
+// TIP W4: Normalize into myFrameQueue.getBufferToUpdate(outW * outH * sizeof(float), TOP_BufferFlags::None) instead
+//         of createOutputBuffer (skip the frame if it returns nullptr), then hand it over:
+//             BufferInfo done;  done.buf = buf;  done.uploadInfo = info;   // info built as in E6
+//             myFrameQueue.updateComplete(done);
+// TIP W5: Anything both threads touch (myError, myRunMs, the model pointer) needs myLock or a std::atomic. A data
+//         race here shows up as rare, random crashes in TD, which are hard to trace back.
 
-    info.colorBufferIndex = colorBufferIndex;
-
-    uint64_t layerBytes = uint64_t(info.textureDesc.width) * info.textureDesc.height * 4 * sizeof(float);
-    uint64_t byteSize = layerBytes * numLayers;
-    OP_SmartRef<TOP_Buffer> buf = myContext->createOutputBuffer(byteSize, TOP_BufferFlags::None, nullptr);
-
-    uint64_t byteOffset = 0;
-    for (int i = 0; i < numLayers; i++) {
-        myStep += speed;
-        fillBuffer(buf, byteOffset, info.textureDesc.width, info.textureDesc.height, myStep, myBrightness);
-        byteOffset += layerBytes;
-    }
-
-    output->uploadBuffer(&buf, info, nullptr);
-}
-
-void DepthAnythingNativeTOP::fillBuffer(OP_SmartRef<TOP_Buffer>& buf, uint64_t byteOffset, int width, int height, double step, double brightness) {
-    assert(buf->size - byteOffset >= uint64_t(width) * height * sizeof(float) * 4);
-
-    char* bytePtr = (char*)buf->data;
-    bytePtr += byteOffset;
-
-    float* mem = (float*)bytePtr;
-
-    int xstep = (int)(fmod(step, width));
-    int ystep = (int)(fmod(step, height));
-
-    if (xstep < 0)
-        xstep += width;
-
-    if (ystep < 0)
-        ystep += height;
-
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            float* pixel = &mem[4 * (y * width + x)];
-
-            // RGBA
-            pixel[0] = (x > xstep) * (float)brightness;
-            pixel[1] = (y > ystep) * (float)brightness;
-            pixel[2] = ((float)(xstep % 50) / 50.0f) * (float)brightness;
-            pixel[3] = 1;
-        }
-    }
-}
-
-void DepthAnythingNativeTOP::startMoreWork() {
-    {
-        std::unique_lock<std::mutex> lck(myConditionLock);
-        myStartWork = true;
-    }
-    myCondition.notify_one();
-}
-
-void DepthAnythingNativeTOP::waitForMoreWork() {
-    std::unique_lock<std::mutex> lck(myConditionLock);
-    myCondition.wait(lck, [this]() { return this->myStartWork.load(); });
-    myStartWork = false;
-}
-
-int32_t
-DepthAnythingNativeTOP::getNumInfoCHOPChans(void* reserved1) {
-    // We return the number of channel we want to output to any Info CHOP
-    // connected to the TOP. In this example we are just going to send one channel.
-    return 2;
+int32_t DepthAnythingNativeTOP::getNumInfoCHOPChans(void* reserved1) {
+    // TIP I1: Channels for an Info CHOP pointed at this TOP, e.g. run_ms (myRunMs), frames processed, frames the
+    //         worker skipped. Return how many you have; getInfoCHOPChan is then called once per index.
+    return 0;
 }
 
 void DepthAnythingNativeTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* reserved1) {
-    // This function will be called once for each channel we said we'd want to return
-    // In this example it'll only be called once.
-
-    if (index == 0) {
-        chan->name->setString("executeCount");
-        chan->value = (float)myExecuteCount;
-    }
-
-    if (index == 1) {
-        chan->name->setString("step");
-        chan->value = (float)myStep;
-    }
+    // TIP I2: if (index == 0) { chan->name->setString("run_ms"); chan->value = (float)myRunMs; }
 }
 
 bool DepthAnythingNativeTOP::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1) {
-    infoSize->rows = 2;
-    infoSize->cols = 2;
-    // Setting this to false means we'll be assigning values to the table
-    // one row at a time. True means we'll do it one column at a time.
-    infoSize->byColumn = false;
-    return true;
+    // TIP I3: For an Info DAT table (e.g. model path, input size, output size): set infoSize->rows / cols,
+    //         byColumn = false, return true, and fill rows in getInfoDATEntries. false = no table.
+    return false;
 }
 
-void DepthAnythingNativeTOP::getInfoDATEntries(int32_t index,
-                                               int32_t nEntries,
-                                               OP_InfoDATEntries* entries,
+void DepthAnythingNativeTOP::getInfoDATEntries(int32_t index, int32_t nEntries, OP_InfoDATEntries* entries,
                                                void* reserved1) {
-    char tempBuffer[4096];
+    // TIP I4: Row `index`: entries->values[0]->setString("model"); entries->values[1]->setString(path);
+}
 
-    if (index == 0) {
-        // Set the value for the first column
-#ifdef _WIN32
-        strcpy_s(tempBuffer, "executeCount");
-#else  // macOS
-        strlcpy(tempBuffer, "executeCount", sizeof(tempBuffer));
-#endif
-        entries->values[0]->setString(tempBuffer);
+void DepthAnythingNativeTOP::getWarningString(OP_String* warning, void* reserved1) {
+    // TIP R2: A yellow warning that doesn't stop the node, e.g. "Loading model..." while the worker is in
+    //         depth_create: warning->setString("Loading model...");
+}
 
-        // Set the value for the second column
-#ifdef _WIN32
-        sprintf_s(tempBuffer, "%d", myExecuteCount);
-#else  // macOS
-        snprintf(tempBuffer, sizeof(tempBuffer), "%d", myExecuteCount);
-#endif
-        entries->values[1]->setString(tempBuffer);
-    }
-
-    if (index == 1) {
-#ifdef _WIN32
-        strcpy_s(tempBuffer, "step");
-#else  // macOS
-        strlcpy(tempBuffer, "step", sizeof(tempBuffer));
-#endif
-        entries->values[0]->setString(tempBuffer);
-
-#ifdef _WIN32
-        sprintf_s(tempBuffer, "%g", myStep);
-#else  // macOS
-        snprintf(tempBuffer, sizeof(tempBuffer), "%g", myStep);
-#endif
-        entries->values[1]->setString(tempBuffer);
-    }
+void DepthAnythingNativeTOP::getErrorString(OP_String* error, void* reserved1) {
+    // TIP R1: if (!myError.empty()) error->setString(myError.c_str());
+    //         TD shows it on the node in red until this stops setting a string. Lock first if the worker writes it.
 }
 
 void DepthAnythingNativeTOP::setupParameters(OP_ParameterManager* manager, void* reserved1) {
-    // brightness
-    {
-        OP_NumericParameter np;
-
-        np.name = "Brightness";
-        np.label = "Brightness";
-        np.defaultValues[0] = 1.0;
-
-        np.minSliders[0] = 0.0;
-        np.maxSliders[0] = 1.0;
-
-        np.minValues[0] = 0.0;
-        np.maxValues[0] = 1.0;
-
-        np.clampMins[0] = true;
-        np.clampMaxes[0] = true;
-
-        OP_ParAppendResult res = manager->appendFloat(np);
-        assert(res == OP_ParAppendResult::Success);
-    }
-
-    // speed
-    {
-        OP_NumericParameter np;
-
-        np.name = "Speed";
-        np.label = "Speed";
-        np.defaultValues[0] = 1.0;
-        np.minSliders[0] = -10.0;
-        np.maxSliders[0] = 10.0;
-
-        OP_ParAppendResult res = manager->appendFloat(np);
-        assert(res == OP_ParAppendResult::Success);
-    }
-
-    // pulse
-    {
-        OP_NumericParameter np;
-
-        np.name = "Reset";
-        np.label = "Reset";
-
-        OP_ParAppendResult res = manager->appendPulse(np);
-        assert(res == OP_ParAppendResult::Success);
-    }
+    // Parameter names follow the opType rule: a capital first letter, then only lower case letters or digits.
+    // Setting np.page / sp.page = "Depth" puts them on their own page.
+    //
+    // TIP P1: A model override, to try other .mlmodelc builds without rebuilding the plugin:
+    //             OP_StringParameter sp;
+    //             sp.name = "Model";  sp.label = "Model (.mlmodelc)";  sp.defaultValue = "";
+    //             OP_ParAppendResult res = manager->appendFolder(sp);   // .mlmodelc is a folder, not a file
+    //             assert(res == OP_ParAppendResult::Success);
+    //         Read it with inputs->getParFilePath("Model"): an absolute path when it exists. Empty = bundled model.
+    // TIP P2: A raw/normalized switch for E5:
+    //             OP_NumericParameter np;  np.name = "Normalize";  np.label = "Normalize";  np.defaultValues[0] = 1;
+    //             manager->appendToggle(np);          // read with inputs->getParInt("Normalize")
+    // TIP P3: A "Reload" pulse (manager->appendPulse(np)), handled in pulsePressed(): destroy the model and clear
+    //         myError so the next cook loads it again, e.g. after changing Model.
 }
 
 void DepthAnythingNativeTOP::pulsePressed(const char* name, void* reserved1) {
-    if (!strcmp(name, "Reset")) {
-        myStep = 0.0;
-    }
+    // TIP P4: if (!strcmp(name, "Reload")) { ... }   With a worker running, signal it to reload rather than
+    //         destroying the model under it (W5).
 }
