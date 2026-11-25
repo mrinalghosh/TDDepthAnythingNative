@@ -61,13 +61,13 @@ class DepthAnythingNativeTOP : public TOP_CPlusPlusBase {
     FrameQueue myFrameQueue;
 
     // TIP M1: Members you'll likely add as you go (none are needed to compile):
-    //   DepthModel*                        myModel = nullptr;  owned; depth_destroy it in the destructor
-    //   bool                               myLoadTried = false; so a failed load isn't retried every cook
-    //   int                                myOutW = 0, myOutH = 0;  from depth_output_size (518x392)
-    //   std::vector<float>                 myDepth;            myOutW * myOutH, filled by depth_run
-    //   std::string                        myError;            returned by getErrorString(); empty = no error
+    DepthModel* myModel = nullptr;  // owned; depth_destroy it in the destructor
+    bool myLoadTried = false;       // a failed load isn't retried every cook
+    std::string myError;            //    returned by getErrorString(); empty = no error
+    int myOutW = 0, myOutH = 0;     // from depth_output_size (518x392)
+    std::vector<float> myDepth;     // myOutW * myOutH, filled by depth_run
+    double myRunMs = 0;             //     last depth_run time, for the Info CHOP
     //   OP_SmartRef<OP_TOPDownloadResult>  myPrevDownload;     last frame's download (E3's no-stall option)
-    //   double                             myRunMs = 0;        last depth_run time, for the Info CHOP
     // Threaded version adds:
     //   std::thread                        myWorker;
     //   std::mutex                         myLock;             guards everything shared with the worker

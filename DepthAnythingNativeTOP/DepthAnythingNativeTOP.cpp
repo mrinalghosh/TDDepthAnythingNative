@@ -117,18 +117,36 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
 
     // TIP E2: Make sure the model is loaded (synchronous version; the worker does this in the threaded one).
     //         Only try once: set myLoadTried = true first, so a failing load isn't repeated every cook.
-    bool myLoadTried = true;  // do I declare this here or globally?
 
-    //         Pick the path: the Model parameter if it's set (P1), otherwise the bundled model:
-    //             char path[1024];
-    //             if (depth_bundled_model_path(path, sizeof path) != 0) { myError = "No bundled model"; return; }
-    //         then load it:
-    //             char err[512];
-    //             myModel = depth_create(path, err, sizeof err);
-    //         On nullptr, myError = err and return; the node shows it via getErrorString() (R1).
-    //         After loading: depth_output_size(myModel, &myOutW, &myOutH) and myDepth.resize(myOutW * myOutH).
-    //         (E4-E6 below write outW/outH for short; they mean myOutW/myOutH.)
-    //
+    if (!myModel && !myLoadTried) {
+        myLoadTried = true;  // set before we start trying
+
+        //  Pick the path: the Model parameter if it's set (P1), otherwise the bundled model:
+        //      char path[1024];
+        //      if (depth_bundled_model_path(path, sizeof path) != 0) { myError = "No bundled model"; return; }
+        //  then load it:
+        //      char err[512];
+        //      myModel = depth_create(path, err, sizeof err);
+        //  On nullptr, myError = err and return; the node shows it via getErrorString() (R1).
+        //  After loading: depth_output_size(myModel, &myOutW, &myOutH) and myDepth.resize(myOutW * myOutH).
+        //  (E4-E6 below write outW/outH for short; they mean myOutW/myOutH.)
+
+        char path[1024];
+        if (depth_bundled_model_path(path, sizeof(path)) != 0) {
+            myError = "No bundled model found";  // getErrorString()
+            return;
+        }
+
+        char err[512];
+        myModel = depth_create(path, err, sizeof(err));
+
+        depth_output_size(myModel, &myOutW, &myOutH);
+        myDepth.resize(myOutW * myOutH);  // allocate the vector myDepth
+    }
+
+    if (!myModel)
+        return;
+
     // TIP E3: Download the input as top-down BGRA, exactly what depth_run expects:
     //             OP_TOPInputDownloadOptions opts;
     //             opts.pixelFormat  = OP_PixelFormat::BGRA8Fixed;
@@ -140,14 +158,32 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
     //         res->getData() blocks until the GPU->CPU copy lands. Either accept that stall for a first version, or do
     //         what the CPUMemoryTOP sample does: keep this frame's result in myPrevDownload and process last frame's
     //         instead (one frame of latency, no stall). Watch for an empty myPrevDownload on the first cook.
-    //
+    OP_TOPInputDownloadOptions opts;
+    opts.pixelFormat = OP_PixelFormat::BGRA8Fixed;
+    opts.colorSpace = OP_ColorSpace::SRGB;
+    opts.verticalFlip = true;  // NOTE: TD's textures are bottom up - model wants row 0 = top
+
+    OP_SmartRef<OP_TOPDownloadResult> res = top->downloadTexture(opts, nullptr);  // copies the input image from the GPU to CPU so depth_run can read it
     // TIP E4: Run the model:
     //             int w = res->textureDesc.width, h = res->textureDesc.height;
     //             size_t stride = res->size / h;          // bytes per row; don't assume w * 4
     //             int rc = depth_run(myModel, (const uint8_t*)res->getData(), w, h, stride, myDepth.data());
     //         Nonzero rc = failure (codes are listed above depth_run in DepthModel.mm). Time it with
     //         std::chrono::steady_clock into myRunMs for the Info CHOP (I1).
-    //
+    int w = res->textureDesc.width, h = res->textureDesc.height;
+    size_t stride = res->size / h;  // bytes per row | NOTE: this is because GPUs and drivers sometimes add even amounts of padding at the end of each row
+
+    const uint8_t* pixels = static_cast<const uint8_t*>(res->getData());
+
+    auto t0 = std::chrono::steady_clock::now();
+    int rc = depth_run(myModel, pixels, w, h, stride, myDepth.data());
+    myRunMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (rc) {  // failure
+        myError = "depth_run failed (" + std::to_string(rc) + ")";
+        return;
+    }
+    myError.clear();  // frame computed so no error message
+
     // TIP E5: Normalize into an output buffer:
     //             OP_SmartRef<TOP_Buffer> buf =
     //                 myContext->createOutputBuffer(outW * outH * sizeof(float), TOP_BufferFlags::None, nullptr);
@@ -156,7 +192,16 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
     //         stretch (std::minmax_element; guard max == min) gives a fuller range. Per-frame min/max makes the
     //         image "breathe" when objects enter or leave; smoothing min and max over time (e.g.
     //         m = m * 0.9 + frameMin * 0.1) calms it down. A toggle for raw output (P2) is handy for comparing.
-    //
+
+    OP_SmartRef<TOP_Buffer> buf = myContext->createOutputBuffer(myOutW * myOutH * sizeof(float), TOP_BufferFlags::None, nullptr);
+    float* px = static_cast<float*>(buf->data);
+    auto mm = std::minmax_element(myDepth.begin(), myDepth.end());
+    float lo = *mm.first, hi = *mm.second;
+    float range = hi - lo;
+    for (size_t i = 0; i < myDepth.size(); ++i) {
+        px[i] = (range > 0) ? (myDepth[i] - lo) : 0.0f;
+    }
+
     // TIP E6: Upload:
     //             TOP_UploadInfo info;
     //             info.textureDesc.width       = outW;
@@ -168,7 +213,15 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
     //             output->uploadBuffer(&buf, info, nullptr);   // takes ownership: buf is empty afterwards
     //         Output is 518x392 whatever the input size; resample it downstream (Fit or Resolution TOP) to match.
     //         Mono32Float keeps full precision for displacement; Mono16Float halves the upload if that's enough.
-    //
+    TOP_UploadInfo info;
+    info.textureDesc.width = myOutW;
+    info.textureDesc.height = myOutH;
+    info.textureDesc.texDim = OP_TexDim::e2D;
+    info.textureDesc.pixelFormat = OP_PixelFormat::Mono32Float;
+    info.firstPixel = TOP_FirstPixel::TopLeft;
+    info.colorSpace = OP_ColorSpace::Passthrough;
+    output->uploadBuffer(&buf, info, nullptr);
+
     // Threaded version (TIP W1-W5 below): keep E1 and E3 here, but hand `res` to the worker instead of calling
     // getData(), and upload whatever the worker finished last:
     //             BufferInfo done = myFrameQueue.getBufferToUpload();
