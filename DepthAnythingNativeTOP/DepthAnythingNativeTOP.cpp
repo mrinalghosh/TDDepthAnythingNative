@@ -99,6 +99,7 @@ DepthAnythingNativeTOP::~DepthAnythingNativeTOP() {
     //         never cooked has none, and join() on an empty std::thread throws (= TD crashes).
     //         It may be in the middle of depth_run, so the model must outlive it.
     // TIP D2: Then depth_destroy(myModel); it's fine to call with nullptr.
+    depth_destroy(myModel);
     // TIP D3: OP_SmartRef members (download results, buffers) release themselves; nothing to do for those.
 }
 
@@ -132,6 +133,11 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
         //  (E4-E6 below write outW/outH for short; they mean myOutW/myOutH.)
 
         char path[1024];
+        const char* par = inputs->getParFilePath("Model");
+        if (par && *par) {  // not null and first character not empty
+            snprintf(path, sizeof(path), par);
+        }
+
         if (depth_bundled_model_path(path, sizeof(path)) != 0) {
             myError = "No bundled model found";  // getErrorString()
             return;
@@ -139,6 +145,10 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
 
         char err[512];
         myModel = depth_create(path, err, sizeof(err));
+        if (!myModel) {
+            myError = err;
+            return;
+        }
 
         depth_output_size(myModel, &myOutW, &myOutH);
         myDepth.resize(myOutW * myOutH);  // allocate the vector myDepth
@@ -173,9 +183,11 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
     int w = res->textureDesc.width, h = res->textureDesc.height;
     size_t stride = res->size / h;  // bytes per row | NOTE: this is because GPUs and drivers sometimes add even amounts of padding at the end of each row
 
-    const uint8_t* pixels = static_cast<const uint8_t*>(res->getData());
-
     auto t0 = std::chrono::steady_clock::now();
+    const uint8_t* pixels = static_cast<const uint8_t*>(res->getData());
+    myDownloadMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+
+    t0 = std::chrono::steady_clock::now();
     int rc = depth_run(myModel, pixels, w, h, stride, myDepth.data());
     myRunMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (rc) {  // failure
@@ -183,6 +195,7 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
         return;
     }
     myError.clear();  // frame computed so no error message
+    ++myFrames;
 
     // TIP E5: Normalize into an output buffer:
     //             OP_SmartRef<TOP_Buffer> buf =
@@ -195,11 +208,15 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
 
     OP_SmartRef<TOP_Buffer> buf = myContext->createOutputBuffer(myOutW * myOutH * sizeof(float), TOP_BufferFlags::None, nullptr);
     float* px = static_cast<float*>(buf->data);
-    auto mm = std::minmax_element(myDepth.begin(), myDepth.end());
-    float lo = *mm.first, hi = *mm.second;
-    float range = hi - lo;
-    for (size_t i = 0; i < myDepth.size(); ++i) {
-        px[i] = (range > 0) ? (myDepth[i] - lo) : 0.0f;
+    if (inputs->getParInt("Normalize")) {
+        auto mm = std::minmax_element(myDepth.begin(), myDepth.end());
+        float lo = *mm.first, hi = *mm.second;
+        float range = hi - lo;
+        for (size_t i = 0; i < myDepth.size(); ++i) {
+            px[i] = (range > 0) ? (myDepth[i] - lo) / range : 0.0f;
+        }
+    } else {
+        std::copy(myDepth.begin(), myDepth.end(), px);
     }
 
     // TIP E6: Upload:
@@ -251,11 +268,29 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
 int32_t DepthAnythingNativeTOP::getNumInfoCHOPChans(void* reserved1) {
     // TIP I1: Channels for an Info CHOP pointed at this TOP, e.g. run_ms (myRunMs), frames processed, frames the
     //         worker skipped. Return how many you have; getInfoCHOPChan is then called once per index.
-    return 0;
+    return 4;
 }
 
 void DepthAnythingNativeTOP::getInfoCHOPChan(int32_t index, OP_InfoCHOPChan* chan, void* reserved1) {
     // TIP I2: if (index == 0) { chan->name->setString("run_ms"); chan->value = (float)myRunMs; }
+    switch (index) {
+        case 0:
+            chan->name->setString("run_ms");
+            chan->value = (float)myRunMs;
+            break;
+        case 1:
+            chan->name->setString("download_ms");
+            chan->value = (float)myDownloadMs;
+            break;
+        case 2:
+            chan->name->setString("loaded");
+            chan->value = (myModel != nullptr) ? 1.f : 0.f;
+            break;
+        case 3:
+            chan->name->setString("frames");
+            chan->value = (float)myFrames;
+            break;
+    }
 }
 
 bool DepthAnythingNativeTOP::getInfoDATSize(OP_InfoDATSize* infoSize, void* reserved1) {
@@ -275,8 +310,10 @@ void DepthAnythingNativeTOP::getWarningString(OP_String* warning, void* reserved
 }
 
 void DepthAnythingNativeTOP::getErrorString(OP_String* error, void* reserved1) {
-    // TIP R1: if (!myError.empty()) error->setString(myError.c_str());
-    //         TD shows it on the node in red until this stops setting a string. Lock first if the worker writes it.
+    // TD shows it on the node in red until this stops setting a string. Lock first if the worker writes it.
+    if (!myError.empty()) {
+        error->setString(myError.c_str());
+    }
 }
 
 void DepthAnythingNativeTOP::setupParameters(OP_ParameterManager* manager, void* reserved1) {
