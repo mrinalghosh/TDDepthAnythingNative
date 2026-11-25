@@ -27,7 +27,7 @@
 using namespace TD;
 
 // Runs Depth Anything V2 (Core ML, see DepthModel.h) on the input TOP and outputs a mono float depth map.
-// The plugin boilerplate is done; the numbered TIPs in DepthAnythingNativeTOP.cpp walk through the TOP itself.
+// The synchronous version is done; the TIPs left in DepthAnythingNativeTOP.cpp (W1-W5) walk through threading it.
 class DepthAnythingNativeTOP : public TOP_CPlusPlusBase {
    public:
     DepthAnythingNativeTOP(const OP_NodeInfo* info, TOP_Context* context);
@@ -60,7 +60,6 @@ class DepthAnythingNativeTOP : public TOP_CPlusPlusBase {
     // threaded version (TIP W1-W5).
     FrameQueue myFrameQueue;
 
-    // TIP M1: Members you'll likely add as you go (none are needed to compile):
     DepthModel* myModel = nullptr;  // owned; depth_destroy it in the destructor
     bool myLoadTried = false;       // a failed load isn't retried every cook
     std::string myError;            //    returned by getErrorString(); empty = no error
@@ -69,7 +68,6 @@ class DepthAnythingNativeTOP : public TOP_CPlusPlusBase {
     double myDownloadMs = 0;        //     time spent in getData()
     double myRunMs = 0;             //     last depth_run time, for the Info CHOP
     int64_t myFrames = 0;
-    //   OP_SmartRef<OP_TOPDownloadResult>  myPrevDownload;     last frame's download (E3's no-stall option)
     // Threaded version adds:
     //   std::thread                        myWorker;
     //   std::mutex                         myLock;             guards everything shared with the worker
