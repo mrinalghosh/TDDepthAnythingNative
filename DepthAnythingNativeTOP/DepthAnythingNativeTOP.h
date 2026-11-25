@@ -66,7 +66,9 @@ class DepthAnythingNativeTOP : public TOP_CPlusPlusBase {
     std::string myError;            //    returned by getErrorString(); empty = no error
     int myOutW = 0, myOutH = 0;     // from depth_output_size (518x392)
     std::vector<float> myDepth;     // myOutW * myOutH, filled by depth_run
+    double myDownloadMs = 0;        //     time spent in getData()
     double myRunMs = 0;             //     last depth_run time, for the Info CHOP
+    int64_t myFrames = 0;
     //   OP_SmartRef<OP_TOPDownloadResult>  myPrevDownload;     last frame's download (E3's no-stall option)
     // Threaded version adds:
     //   std::thread                        myWorker;

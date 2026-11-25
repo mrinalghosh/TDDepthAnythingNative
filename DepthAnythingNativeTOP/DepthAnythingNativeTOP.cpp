@@ -135,7 +135,7 @@ void DepthAnythingNativeTOP::execute(TOP_Output* output, const OP_Inputs* inputs
         char path[1024];
         const char* par = inputs->getParFilePath("Model");
         if (par && *par) {  // not null and first character not empty
-            snprintf(path, sizeof(path), par);
+            snprintf(path, sizeof(path), "%s", par);
         }
 
         if (depth_bundled_model_path(path, sizeof(path)) != 0) {
